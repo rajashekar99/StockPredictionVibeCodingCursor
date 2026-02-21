@@ -1,4 +1,4 @@
-# India Stock Market AI Prediction Tool
+# India Stock Market AI Prediction Tool Using vibe coding
 
 This is a Streamlit-based web app that fetches **Indian stock market (NSE/BSE)** historical data, pulls recent news, and uses **OpenAI** to generate **sentiment analysis** and a **short-term outlook** for selected stocks.
 
