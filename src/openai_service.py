@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from openai import OpenAI
 
@@ -18,7 +19,10 @@ def _get_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-def analyze_news_sentiment(news: List[NewsItem]) -> Dict[str, Any]:
+def analyze_news_sentiment(
+    news: List[NewsItem],
+    company_name: str = "",
+) -> Dict[str, Any]:
     """Use OpenAI to classify sentiment for each news item and aggregate."""
     if not news:
         return {
@@ -30,31 +34,43 @@ def analyze_news_sentiment(news: List[NewsItem]) -> Dict[str, Any]:
 
     client = _get_client()
 
-    headlines = [n.title for n in news]
-    chunks = chunk_list(headlines, max_len=10)
+    # Build text: headline first (for model to echo back), then snippet for context
+    items_text = [
+        (n.title, (n.description or "")[:200].strip()) for n in news
+    ]
+    chunk_strings = [
+        f"{t}\n  Snippet: {d}" if d else t for t, d in items_text
+    ]
+    chunks = chunk_list(chunk_strings, max_len=8)
 
     sentiment_details: List[Dict[str, Any]] = []
+    company_context = f" (all headlines are about this company/stock: {company_name})" if company_name else ""
 
     for chunk in chunks:
         prompt = (
-            "You are a financial news sentiment analyst. "
+            "You are a financial news sentiment analyst for Indian equities. "
             "Classify each headline as 'positive', 'negative', or 'neutral' "
-            "for the underlying stock, and assign a sentiment score between "
-            "-1 (very negative) and 1 (very positive).\n\n"
+            "for the underlying stock impact, and assign a sentiment score strictly between "
+            "-1 (very negative) and 1 (very positive). Use decimals (e.g. 0.3, -0.5). "
+            "Base your judgment on how the news would typically affect the stock price."
+            f"{company_context}\n\n"
         )
 
         for i, h in enumerate(chunk, start=1):
             prompt += f"{i}. {h}\n"
 
         prompt += (
-            "\nRespond in JSON with a list named 'sentiments', where each item has:\n"
-            "{'headline': str, 'label': 'positive'|'negative'|'neutral', 'score': float}."
+            "\nRespond in JSON with a single key 'sentiments': a list of objects, "
+            "each with keys: 'headline' (the exact headline only, first line of each item above), "
+            "'label' ('positive'|'negative'|'neutral'), 'score' (float in [-1, 1]). "
+            "One item per numbered item, same order."
         )
 
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
+            temperature=0.2,
         )
 
         try:
@@ -67,6 +83,10 @@ def analyze_news_sentiment(news: List[NewsItem]) -> Dict[str, Any]:
 
             parsed = json.loads(raw)
             sentiments = parsed.get("sentiments", [])
+            for s in sentiments:
+                score = float(s.get("score", 0.0))
+                score = max(-1.0, min(1.0, score))  # clamp to [-1, 1]
+                s["score"] = score
             sentiment_details.extend(sentiments)
         except Exception as exc:
             raise RuntimeError(f"Failed to parse sentiment JSON: {exc}")
@@ -101,17 +121,24 @@ def generate_price_outlook(
     company_name: str,
     hist_summary: str,
     sentiment_summary: str,
-) -> str:
-    """Generate a short-term outlook and explanation using OpenAI."""
+    sentiment_details: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Generate a short-term outlook as structured JSON (direction, confidence, reasons, risks, disclaimer)."""
     client = _get_client()
 
     system_prompt = (
         "You are a financial analysis assistant focused on Indian equities. "
-        "Given recent price action and news sentiment, provide a short-term "
-        "OUTLOOK for the stock (up / down / sideways) with a confidence level, "
-        "plus 3–5 bullet points on reasons and risks.\n\n"
-        "IMPORTANT: You must always include the disclaimer:\n"
-        "\"This is not financial advice. Do your own research.\""
+        "Base your answer ONLY on the provided price action and news sentiment. "
+        "Use the headline-level sentiment below where provided to support your outlook. "
+        "When price action and sentiment align, give a clear directional outlook (up or down) with medium or high confidence. "
+        "Reserve sideways or low confidence for when signals conflict, volatility is high, or the picture is genuinely mixed. "
+        "Do not speculate beyond the given data. "
+        "Respond with a JSON object only, no other text. Use exactly these keys: "
+        "'direction' (one of: up, down, sideways), "
+        "'confidence' (one of: low, medium, high), "
+        "'reasons' (array of 3-5 short strings citing specific numbers from the data), "
+        "'risks' (array of 0-3 short strings), "
+        "'disclaimer' (exactly: \"This is not financial advice. Do your own research.\")."
     )
 
     user_prompt = f"""
@@ -123,8 +150,16 @@ Recent price action summary:
 
 News sentiment summary:
 {sentiment_summary}
+"""
+    if sentiment_details:
+        user_prompt += f"""
 
-Provide a concise outlook for the next few weeks for a retail investor.
+Relevant headlines and scores:
+{sentiment_details}
+"""
+    user_prompt += """
+
+Provide a concise outlook for the next few weeks for a retail investor as a single JSON object with keys: direction, confidence, reasons, risks, disclaimer.
 """
 
     completion = client.chat.completions.create(
@@ -133,12 +168,43 @@ Provide a concise outlook for the next few weeks for a retail investor.
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        temperature=0.25,
+        response_format={"type": "json_object"},
     )
 
     try:
-        return completion.choices[0].message.content
+        raw = completion.choices[0].message.content
     except Exception as exc:
         raise RuntimeError(f"Unexpected OpenAI response format: {exc}")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse outlook JSON: {exc}")
+
+    direction = (parsed.get("direction") or "sideways").lower()
+    if direction not in ("up", "down", "sideways"):
+        direction = "sideways"
+    confidence = (parsed.get("confidence") or "medium").lower()
+    if confidence not in ("low", "medium", "high"):
+        confidence = "medium"
+    reasons = parsed.get("reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    reasons = [str(r) for r in reasons if r]
+    risks = parsed.get("risks")
+    if not isinstance(risks, list):
+        risks = []
+    risks = [str(r) for r in risks if r]
+    disclaimer = parsed.get("disclaimer") or "This is not financial advice. Do your own research."
+
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "reasons": reasons,
+        "risks": risks,
+        "disclaimer": disclaimer,
+    }
 
 
 def chat_about_stock(
@@ -177,10 +243,11 @@ News sentiment summary:
             {"role": "user", "content": context},
             {"role": "user", "content": user_question},
         ],
+        temperature=0.4,
     )
 
     try:
-        return completion.choices[0].message.content
+        return completion.choices[0].message.content or ""
     except Exception as exc:
         raise RuntimeError(f"Unexpected OpenAI response format: {exc}")
 

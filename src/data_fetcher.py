@@ -4,7 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -31,16 +31,36 @@ class NewsItem:
     source: str
 
 
-def _extract_keywords(company_name: str) -> List[str]:
-    """Extract searchable keywords from company display name.
+def _extract_keywords(company_name: str, symbol: Optional[str] = None) -> List[str]:
+    """Extract searchable keywords from company display name and optional symbol.
 
-    E.g. 'Reliance Industries (NSE)' -> ['Reliance', 'Industries']
+    E.g. 'Reliance Industries (NSE)' -> ['Reliance', 'Industries'];
+    with symbol 'RELIANCE.NS' adds 'RELIANCE', 'RIL' (common ticker aliases).
     """
     # Strip parenthetical suffix like (NSE)
     cleaned = re.sub(r"\s*\([^)]+\)\s*$", "", company_name).strip()
-    # Split on non-word chars, keep tokens of 2+ chars
     tokens = re.findall(r"[a-zA-Z0-9]{2,}", cleaned)
-    return [t for t in tokens if t.lower() not in ("ns", "bse", "nse")]
+    keywords = [t for t in tokens if t.lower() not in ("ns", "bse", "nse")]
+
+    if symbol:
+        # Add ticker base (e.g. RELIANCE from RELIANCE.NS, TCS from TCS.NS)
+        base = re.sub(r"\.(NS|BO|NSE|BSE)$", "", symbol, flags=re.IGNORECASE).strip()
+        if base and base not in keywords:
+            keywords.append(base)
+        # Common ticker aliases for better headline matching
+        ticker_aliases: Dict[str, List[str]] = {
+            "RELIANCE": ["RIL", "Reliance"],
+            "HDFCBANK": ["HDFC"],
+            "ICICIBANK": ["ICICI"],
+            "AXISBANK": ["Axis"],
+            "KOTAKBANK": ["Kotak"],
+            "BHARTIARTL": ["Airtel", "Bharti"],
+        }
+        base_upper = base.upper() if base else ""
+        for alias in ticker_aliases.get(base_upper, []):
+            if alias not in keywords:
+                keywords.append(alias)
+    return keywords
 
 
 def _fetch_rss_feed(url: str) -> List[dict]:
@@ -92,12 +112,14 @@ def fetch_historical_data(
 def fetch_news_for_stock(
     company_name: str,
     max_articles: int = 10,
+    symbol: Optional[str] = None,
 ) -> Tuple[List[NewsItem], Optional[str]]:
     """Fetch recent news for a company from Indian financial RSS feeds.
 
     Returns (news_items, warning_message). No API key required.
+    Pass symbol (e.g. RELIANCE.NS) to improve relevance via ticker keywords.
     """
-    keywords = _extract_keywords(company_name)
+    keywords = _extract_keywords(company_name, symbol=symbol)
     seen_urls: set = set()
     matched_items: List[NewsItem] = []
     unfiltered_items: List[NewsItem] = []
